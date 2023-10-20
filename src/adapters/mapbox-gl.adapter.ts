@@ -7,6 +7,7 @@ import { Feature, LineString, Point, Polygon } from "geojson";
 import mapboxgl, {
 	CircleLayer,
 	FillLayer,
+	GeoJSONSource,
 	LineLayer,
 	PointLike,
 } from "mapbox-gl";
@@ -25,6 +26,16 @@ export class TerraDrawMapboxGLAdapter extends TerraDrawBaseAdapter {
 	private _map: mapboxgl.Map;
 	private _container: HTMLElement;
 	private _rendered = false;
+	private _queue: Map<
+		GeoJSONSource,
+		{
+			pendingPromise: Promise<boolean>;
+			nextPromise?: Promise<boolean>;
+			nextData?: any;
+			nextResolve?: (value: boolean) => void;
+			nextCount?: number;
+		}
+	> = new Map();
 
 	/**
 	 * Clears the map of rendered layers and sources
@@ -158,12 +169,76 @@ export class TerraDrawMapboxGLAdapter extends TerraDrawBaseAdapter {
 		return id;
 	}
 
+	private async _setDataLazy(sourceId: string, newData: any) {
+		const source = this._map.getSource(sourceId) as GeoJSONSource;
+
+		if (source) {
+			const queueItem = this._queue.get(source);
+
+			if (queueItem) {
+				if (queueItem.nextPromise) {
+					// If we're already waiting just update the data for the next iteration + the count.
+					console.log("number waiting:", queueItem.nextCount);
+					this._queue.set(source, {
+						...queueItem,
+						nextData: newData,
+						nextCount: (queueItem.nextCount ?? 0) + 1,
+					});
+					await queueItem.nextPromise;
+				} else {
+					// Unwrap a promise.
+					let resolve: (value: any) => void;
+					const p = new Promise<boolean>((_resolve) => (resolve = _resolve));
+
+					this._queue.set(source, {
+						...queueItem,
+						nextData: newData,
+						nextPromise: p,
+						nextResolve: resolve!,
+						nextCount: (queueItem.nextCount ?? 0) + 1,
+					});
+					await p;
+				}
+			} else {
+				(source as GeoJSONSource).setData(newData);
+				const p = new Promise<boolean>((resolve) => {
+					this._map.on("data", (e: any) => {
+						// Wait for the update to respond from the worker.
+						if (
+							e.dataType === "source" &&
+							e.sourceDataType === "content" &&
+							e.sourceId === sourceId
+						) {
+							resolve(true);
+						}
+					});
+				});
+
+				this._queue.set(source, { pendingPromise: p });
+				try {
+					await p;
+				} catch (err: any) {
+					console.error(err);
+				}
+
+				// Because we're async previously, fetch the data again to see if we have a pending update.
+				const queueItemAfter = this._queue.get(source);
+
+				this._queue.delete(source);
+				if (queueItemAfter && queueItemAfter.nextResolve) {
+					await this._setDataLazy(sourceId, queueItemAfter.nextData);
+					queueItemAfter.nextResolve(true);
+				}
+			}
+		}
+	}
+
 	private _setGeoJSONLayerData<T extends GeoJSONStoreGeometries>(
 		featureType: Feature<T>["geometry"]["type"],
 		features: Feature<T>[],
 	) {
 		const id = `td-${featureType.toLowerCase()}`;
-		(this._map.getSource(id) as any).setData({
+		this._setDataLazy(id, {
 			type: "FeatureCollection",
 			features: features,
 		});
